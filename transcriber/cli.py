@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -67,6 +68,8 @@ def main():
 	parser = argparse.ArgumentParser(description="Local offline transcription pipeline")
 	parser.add_argument("audio", nargs="*", help="Audio file(s) to transcribe")
 	parser.add_argument("--timestamps", action="store_true", help="Write word timestamps")
+	parser.add_argument("--interactive", action="store_true", help="Run interactive terminal UI")
+	parser.add_argument("--cli", action="store_true", help="Force non-interactive CLI mode")
 	parser.add_argument("--audit", action="store_true", help="Write per-chunk audit JSONL")
 	parser.add_argument("--enhance-speech", action="store_true", help="Apply ffmpeg speech enhancement")
 	parser.add_argument("--demucs", action="store_true", help="Use Demucs vocals extraction")
@@ -79,6 +82,10 @@ def main():
 
 	args = parser.parse_args()
 	cfg = load_config()
+
+	if args.cli and args.interactive:
+		print("❌ Choose only one of --cli or --interactive.", file=sys.stderr)
+		raise SystemExit(2)
 
 	if args.no_adjudicate:
 		cfg.adjudicate = False
@@ -93,7 +100,19 @@ def main():
 	use_demucs = bool(args.demucs) or bool(cfg.use_demucs)
 	demucs_model = args.demucs_model or cfg.demucs_model
 
-	if not args.audio and _is_tty():
+	if args.cli:
+		if not args.audio:
+			print("❌ CLI mode requires one or more audio paths.", file=sys.stderr)
+			parser.print_usage()
+			raise SystemExit(2)
+	elif args.interactive or (not args.audio):
+		if not _is_tty():
+			print(
+				"❌ Interactive mode requires a TTY (real terminal).\n"
+				"   Provide audio paths as arguments, or run in a normal terminal.",
+				file=sys.stderr,
+			)
+			raise SystemExit(2)
 		audio_paths, ts = interactive_flow(cfg)
 		args.audio = audio_paths
 		args.timestamps = bool(ts)
@@ -109,8 +128,15 @@ def main():
 	prepared = prepare_inputs_with_progress(paths, tmp_dir, show_progress=cfg.show_progress, enhance_speech=enhance_speech, use_demucs=use_demucs, demucs_model=demucs_model, max_duration_s=300)
 
 	try:
+		import torch
 		import nemo.collections.asr as nemo_asr
-		model = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v3")
+		if not torch.cuda.is_available():
+			print("❌ CUDA GPU not available. This pipeline runs in GPU-strict mode.", file=sys.stderr)
+			raise SystemExit(2)
+		model = nemo_asr.models.ASRModel.from_pretrained(
+			model_name="nvidia/parakeet-tdt-0.6b-v3",
+			map_location=torch.device("cuda"),
+		).to(torch.device("cuda"))
 	except Exception as e:
 		print(f"❌ Failed to load NeMo model: {e}", file=sys.stderr)
 		raise SystemExit(2)
@@ -120,6 +146,32 @@ def main():
 		return transcribe_chunks(base, chunks, model, args.timestamps, cfg, progress=progress, chunk_task_id=task_id, tmp_dir=tmp_dir, allow_fallback=False, audit_path=audit_path)
 
 	run_batch_with_progress(prepared, "NeMo(GPU)", _nemo_file, show_progress=cfg.show_progress)
+
+	master_path = Path("transcripts") / "ALL_TRANSCRIPTS.txt"
+	master_path.parent.mkdir(exist_ok=True)
+	with master_path.open("w", encoding="utf-8") as mf:
+		for audio_file in args.audio:
+			base = Path(audio_file).stem
+			combined = Path("transcripts") / f"{base}.txt"
+			if not combined.exists():
+				continue
+			mf.write(f"==== {base} ====\n")
+			mf.write(combined.read_text(encoding="utf-8", errors="ignore"))
+			mf.write("\n\n")
+
+	if args.timestamps:
+		master_ts_path = Path("transcripts") / "ALL_TIMESTAMPS.txt"
+		with master_ts_path.open("w", encoding="utf-8") as tf:
+			for audio_file in args.audio:
+				base = Path(audio_file).stem
+				combined_ts = Path("transcripts") / f"{base}.timestamps.txt"
+				if not combined_ts.exists():
+					continue
+				tf.write(f"==== {base} ====\n")
+				tf.write(combined_ts.read_text(encoding="utf-8", errors="ignore"))
+				tf.write("\n\n")
+
+	shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

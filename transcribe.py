@@ -15,4 +15,8 @@ from transcriber.cli import main
 
 
 if __name__ == "__main__":
-	main()
+	try:
+		main()
+	except KeyboardInterrupt:
+		print("\n⛔ Closing (Ctrl+C).")
+		raise SystemExit(130)
