@@ -9,7 +9,7 @@ def hypothesis_dir(base: str) -> Path:
 
 def hypothesis_paths(base: str, idx: int) -> dict[str, Path]:
 	out_dir = hypothesis_dir(base)
-	stem = f"{base}_{idx:04d}"
+	stem = f"{base}_{idx:03d}"
 	return {
 		"dir": out_dir,
 		"baseline": out_dir / f"{stem}.baseline.txt",
