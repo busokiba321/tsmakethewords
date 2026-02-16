@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .adjudicate import adjudicate_chunk, build_prompt, run_llama_cpp_json, choose_fallback_best
+from .adjudicate import adjudicate_chunk
 from .audio import nemo_probe_has_text, split_wav_fixed, vad_likely_speech, vad_stats, wav_info, wav_rms
 from .config import AppConfig
 from .hypotheses import hypothesis_paths
@@ -14,8 +14,14 @@ from .utils import combine_files, has_words, is_usable_text_file, transcript_sta
 def chunk_paths(base: str, idx: int):
     transcripts_dir = Path("transcripts")
     transcripts_dir.mkdir(exist_ok=True)
-    chunk_txt = transcripts_dir / f"{base}_{idx:03d}.txt"
-    chunk_ts = transcripts_dir / f"{base}_{idx:03d}.timestamps.txt"
+    clean_dir = transcripts_dir / "clean"
+    ts_dir = transcripts_dir / "timestamps"
+    clean_dir.mkdir(parents=True, exist_ok=True)
+    ts_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_txt = clean_dir / f"{base}_{idx:03d}.txt"
+    chunk_ts = ts_dir / f"{base}_{idx:03d}.timestamps.txt"
+
     combined_txt = transcripts_dir / f"{base}.txt"
     combined_ts = transcripts_dir / f"{base}.timestamps.txt"
     return chunk_txt, chunk_ts, combined_txt, combined_ts
@@ -76,13 +82,27 @@ def transcribe_chunks(
                     "alt_asr": hpaths["alt_asr"].read_text(encoding="utf-8", errors="ignore").strip() if hpaths["alt_asr"].exists() else "",
                 }
                 multi = sum(1 for v in h.values() if has_words(v)) >= 2
-                if multi and (not cfg.adjudicate_only_when_flagged):
-                    prompt = build_prompt(h, chunk_seconds=float(meta.get("duration_s", 0.0) or 0.0), flags=["resume_adjudicate"])
-                    j = run_llama_cpp_json(cfg, prompt)
-                    final = (str(j.get("final", "")).strip() if isinstance(j, dict) else "") or choose_fallback_best(h)
+                if multi:
+                    # Infer "flagged" when non-baseline hypotheses exist.
+                    resume_flags: list[str] = ["resume_adjudicate"]
+                    if is_usable_text_file(hpaths["recover"]):
+                        resume_flags.append("has_recover_hyp")
+                    if is_usable_text_file(hpaths["alt_asr"]):
+                        resume_flags.append("has_alt_asr_hyp")
+
+                    final, j, used = adjudicate_chunk(
+                        cfg,
+                        h,
+                        chunk_seconds=float(meta.get("duration_s", 0.0) or 0.0),
+                        flags=resume_flags,
+                    )
+
                     if has_words(final):
                         if isinstance(j, dict):
-                            hpaths["adjudicated_json"].write_text(json.dumps(j, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                            hpaths["adjudicated_json"].write_text(
+                                json.dumps(j, ensure_ascii=False, indent=2) + "\n",
+                                encoding="utf-8",
+                            )
                         hpaths["adjudicated_txt"].write_text(final + "\n", encoding="utf-8")
                         clean_parts.append(hpaths["adjudicated_txt"])
                         if progress is not None and chunk_task_id is not None:
@@ -158,6 +178,7 @@ def transcribe_chunks(
                 clean_parts.append(chunk_txt)
 
         if timestamps and need_ts:
+            chunk_ts.parent.mkdir(parents=True, exist_ok=True)
             lines = [f"{w['start']:.2f}s→{w['end']:.2f}: {w['word']}\n" for w in result_ts_words]
             chunk_ts.write_text("".join(lines), encoding="utf-8")
         if timestamps and chunk_ts.exists():
