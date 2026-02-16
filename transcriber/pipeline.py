@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from .adjudicate import adjudicate_chunk
+from .alt_asr import run_alt_asr_on_chunk
 from .audio import nemo_probe_has_text, split_wav_fixed, vad_likely_speech, vad_stats, wav_info, wav_rms
 from .config import AppConfig
 from .hypotheses import hypothesis_paths
@@ -25,6 +26,32 @@ def chunk_paths(base: str, idx: int):
     combined_txt = transcripts_dir / f"{base}.txt"
     combined_ts = transcripts_dir / f"{base}.timestamps.txt"
     return chunk_txt, chunk_ts, combined_txt, combined_ts
+
+
+def _run_recover_subchunks(
+    model,
+    chunk_path: Path,
+    base: str,
+    idx: int,
+    *,
+    tmp_dir: Path | None,
+) -> tuple[str, str]:
+    _tmp = tmp_dir if tmp_dir is not None else Path(".tmp_audio_chunks")
+    try:
+        subs = split_wav_fixed(chunk_path, _tmp / "_gpu_recover_subchunks" / f"{base}_{idx:03d}", segment_s=30)
+        texts = []
+        for s in subs:
+            try:
+                o2 = model.transcribe([str(s)], timestamps=False, verbose=False)
+            except Exception:
+                o2 = None
+            if o2:
+                t2 = (getattr(o2[0], "text", "") or "").strip()
+                if t2:
+                    texts.append(t2)
+        return " ".join(texts).strip(), ""
+    except Exception as e:
+        return "", str(e)
 
 
 def transcribe_chunks(
@@ -60,6 +87,14 @@ def transcribe_chunks(
         used_adjudicate = False
         rms = wav_rms(c)
 
+        baseline_ok = False
+        recover_ok = False
+        alt_asr_ok = False
+        nemo_error = ""
+        recover_error = ""
+        alt_asr_error = ""
+        adjudicate_error = ""
+
         hpaths = hypothesis_paths(base, idx)
         hpaths["dir"].mkdir(parents=True, exist_ok=True)
 
@@ -83,19 +118,19 @@ def transcribe_chunks(
                 }
                 multi = sum(1 for v in h.values() if has_words(v)) >= 2
                 if multi:
-                    # Infer "flagged" when non-baseline hypotheses exist.
                     resume_flags: list[str] = ["resume_adjudicate"]
                     if is_usable_text_file(hpaths["recover"]):
                         resume_flags.append("has_recover_hyp")
                     if is_usable_text_file(hpaths["alt_asr"]):
                         resume_flags.append("has_alt_asr_hyp")
 
-                    final, j, used = adjudicate_chunk(
+                    final, j, used, adj_err = adjudicate_chunk(
                         cfg,
                         h,
                         chunk_seconds=float(meta.get("duration_s", 0.0) or 0.0),
                         flags=resume_flags,
                     )
+                    adjudicate_error = adj_err
 
                     if has_words(final):
                         if isinstance(j, dict):
@@ -103,27 +138,31 @@ def transcribe_chunks(
                                 json.dumps(j, ensure_ascii=False, indent=2) + "\n",
                                 encoding="utf-8",
                             )
-                        hpaths["adjudicated_txt"].write_text(final + "\n", encoding="utf-8")
-                        clean_parts.append(hpaths["adjudicated_txt"])
-                        if progress is not None and chunk_task_id is not None:
-                            progress.advance(chunk_task_id, 1)
-                        continue
+                        if used:
+                            hpaths["adjudicated_txt"].write_text(final + "\n", encoding="utf-8")
+                            clean_parts.append(hpaths["adjudicated_txt"])
+                            if progress is not None and chunk_task_id is not None:
+                                progress.advance(chunk_task_id, 1)
+                            continue
 
         result_text = ""
         result_ts_words = []
+        out = None
         try:
             try:
                 out = model.transcribe([str(c)], timestamps=timestamps, verbose=False)
             except TypeError:
                 out = model.transcribe([str(c)], timestamps=timestamps)
-        except Exception:
-            out = None
+        except Exception as e:
+            nemo_error = str(e)
 
         if out:
             result_text = (getattr(out[0], "text", "") or "")
             result_ts_words = (out[0].timestamp.get("word", []) if getattr(out[0], "timestamp", None) else [])
             if has_words(result_text):
                 hpaths["baseline"].write_text(result_text.strip() + "\n", encoding="utf-8")
+
+        baseline_ok = is_usable_text_file(hpaths["baseline"])
 
         if not allow_fallback:
             wc = len((result_text or "").strip().split())
@@ -132,30 +171,41 @@ def transcribe_chunks(
                 _tmp = tmp_dir if tmp_dir is not None else Path(".tmp_audio_chunks")
                 if nemo_probe_has_text(model, c, _tmp, probe_dur_s=15.0):
                     flags.append("low_wpm_probe_confirmed")
-                    subs = split_wav_fixed(c, _tmp / "_gpu_recover_subchunks" / f"{base}_{idx:03d}", segment_s=30)
-                    texts = []
-                    for s in subs:
-                        try:
-                            o2 = model.transcribe([str(s)], timestamps=False, verbose=False)
-                        except Exception:
-                            o2 = None
-                        if o2:
-                            t2 = (getattr(o2[0], "text", "") or "").strip()
-                            if t2:
-                                texts.append(t2)
-                    recovered = " ".join(texts).strip()
-                    if recovered:
-                        hpaths["recover"].write_text(recovered + "\n", encoding="utf-8")
+                    if is_usable_text_file(hpaths["recover"]):
                         used_recover = True
-                        recovered_low_coverage += 1
+                    else:
+                        recovered, recover_error = _run_recover_subchunks(model, c, base, idx, tmp_dir=tmp_dir)
+                        if recovered:
+                            hpaths["recover"].write_text(recovered + "\n", encoding="utf-8")
+                            used_recover = True
+                            recovered_low_coverage += 1
 
         if (not allow_fallback) and (not has_words(result_text)):
             _tmp = tmp_dir if tmp_dir is not None else Path(".tmp_audio_chunks")
             if nemo_probe_has_text(model, c, _tmp, probe_dur_s=15.0):
                 flags.append("empty_probe_confirmed")
                 suspicious_empty += 1
+                if is_usable_text_file(hpaths["recover"]):
+                    used_recover = True
+                else:
+                    recovered, recover_error = _run_recover_subchunks(model, c, base, idx, tmp_dir=tmp_dir)
+                    if recovered:
+                        hpaths["recover"].write_text(recovered + "\n", encoding="utf-8")
+                        used_recover = True
             else:
                 empty_ok += 1
+
+        recover_ok = is_usable_text_file(hpaths["recover"])
+
+        if cfg.alt_asr_enabled and flags and (not is_usable_text_file(hpaths["alt_asr"])):
+            try:
+                alt_txt = run_alt_asr_on_chunk(cfg, c)
+                if has_words(alt_txt):
+                    hpaths["alt_asr"].write_text(alt_txt.strip() + "\n", encoding="utf-8")
+                    flags.append("alt_asr_ran")
+            except Exception as e:
+                alt_asr_error = str(e)
+        alt_asr_ok = is_usable_text_file(hpaths["alt_asr"])
 
         final_text = (result_text or "").strip()
         if cfg.adjudicate:
@@ -164,7 +214,12 @@ def transcribe_chunks(
                 "recover": hpaths["recover"].read_text(encoding="utf-8", errors="ignore").strip() if hpaths["recover"].exists() else "",
                 "alt_asr": hpaths["alt_asr"].read_text(encoding="utf-8", errors="ignore").strip() if hpaths["alt_asr"].exists() else "",
             }
-            final_text, j, used_adjudicate = adjudicate_chunk(cfg, h, chunk_seconds=float(meta.get("duration_s", 0.0) or 0.0), flags=flags)
+            final_text, j, used_adjudicate, adjudicate_error = adjudicate_chunk(
+                cfg,
+                h,
+                chunk_seconds=float(meta.get("duration_s", 0.0) or 0.0),
+                flags=flags,
+            )
             if used_adjudicate and isinstance(j, dict):
                 hpaths["adjudicated_json"].write_text(json.dumps(j, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 hpaths["adjudicated_txt"].write_text(final_text + "\n", encoding="utf-8")
@@ -198,13 +253,20 @@ def transcribe_chunks(
                 "rms": rms,
                 "used_recover": used_recover,
                 "used_adjudicate": used_adjudicate,
+                "baseline_ok": baseline_ok,
+                "recover_ok": recover_ok,
+                "alt_asr_ok": alt_asr_ok,
+                "nemo_error": nemo_error,
+                "recover_error": recover_error,
+                "alt_asr_error": alt_asr_error,
+                "adjudicate_error": adjudicate_error,
                 "wpm": wpm,
                 "vad": vad,
                 "vad_likely_speech": vad_likely,
                 "transcript": st,
-                "hyp_baseline_path": str(hpaths["baseline"]),
-                "hyp_recover_path": str(hpaths["recover"]) if used_recover else "",
-                "hyp_alt_asr_path": str(hpaths["alt_asr"]) if is_usable_text_file(hpaths["alt_asr"]) else "",
+                "hyp_baseline_path": str(hpaths["baseline"]) if baseline_ok else "",
+                "hyp_recover_path": str(hpaths["recover"]) if recover_ok else "",
+                "hyp_alt_asr_path": str(hpaths["alt_asr"]) if alt_asr_ok else "",
                 "adjudicated_path": str(hpaths["adjudicated_txt"]) if used_adjudicate else "",
                 "flags": flags,
             }
