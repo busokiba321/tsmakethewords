@@ -14,14 +14,10 @@ from .utils import combine_files, has_words, is_usable_text_file, transcript_sta
 def chunk_paths(base: str, idx: int):
     transcripts_dir = Path("transcripts")
     transcripts_dir.mkdir(exist_ok=True)
-    clean_dir = transcripts_dir / "clean"
-    ts_dir = transcripts_dir / "timestamps"
-    clean_dir.mkdir(exist_ok=True)
-    ts_dir.mkdir(exist_ok=True)
-    chunk_txt = clean_dir / f"{base}_{idx:03d}.txt"
-    chunk_ts = ts_dir / f"{base}_{idx:03d}.txt"
+    chunk_txt = transcripts_dir / f"{base}_{idx:03d}.txt"
+    chunk_ts = transcripts_dir / f"{base}_{idx:03d}.timestamps.txt"
     combined_txt = transcripts_dir / f"{base}.txt"
-    combined_ts = transcripts_dir / f"{base}_timestamps.txt"
+    combined_ts = transcripts_dir / f"{base}.timestamps.txt"
     return chunk_txt, chunk_ts, combined_txt, combined_ts
 
 
@@ -158,11 +154,13 @@ def transcribe_chunks(
         else:
             if need_clean:
                 chunk_txt.write_text(final_text + "\n", encoding="utf-8")
-            clean_parts.append(chunk_txt)
+            if is_usable_text_file(chunk_txt):
+                clean_parts.append(chunk_txt)
 
         if timestamps and need_ts:
             lines = [f"{w['start']:.2f}s→{w['end']:.2f}: {w['word']}\n" for w in result_ts_words]
             chunk_ts.write_text("".join(lines), encoding="utf-8")
+        if timestamps and chunk_ts.exists():
             ts_parts.append(chunk_ts)
 
         if audit_path is not None:
