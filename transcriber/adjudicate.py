@@ -40,7 +40,7 @@ def build_prompt(hyps: dict[str, str], *, chunk_seconds: float, flags: list[str]
     )
 
 
-def run_llama_cpp_json(cfg: AppConfig, prompt: str) -> dict[str, Any] | None:
+def run_llama_cpp_json(cfg: AppConfig, prompt: str) -> tuple[dict[str, Any] | None, str]:
     cmd = [
         cfg.llama_bin,
         "-m",
@@ -67,21 +67,22 @@ def run_llama_cpp_json(cfg: AppConfig, prompt: str) -> dict[str, Any] | None:
 
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"llama invocation failed: {e}"
     if proc.returncode != 0:
-        return None
+        err = (proc.stderr or "").strip()
+        return None, f"llama nonzero exit ({proc.returncode}): {err[:400]}"
 
     out = (proc.stdout or "").strip()
     if not out:
-        return None
+        return None, "llama produced empty stdout"
     m = re.search(r"\{.*\}", out, flags=re.DOTALL)
     if not m:
-        return None
+        return None, "llama output missing JSON object"
     try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
+        return json.loads(m.group(0)), ""
+    except Exception as e:
+        return None, f"failed to parse llama JSON: {e}"
 
 
 def choose_fallback_best(hyps: dict[str, str]) -> str:
@@ -103,15 +104,15 @@ def adjudicate_chunk(
     *,
     chunk_seconds: float,
     flags: list[str],
-) -> tuple[str, dict[str, Any] | None, bool]:
+) -> tuple[str, dict[str, Any] | None, bool, str]:
     multi = sum(1 for v in hyps.values() if has_words(v)) >= 2
     should = multi and (not cfg.adjudicate_only_when_flagged or bool(flags))
     if not (cfg.adjudicate and should):
-        return (hyps.get("baseline") or "").strip(), None, False
+        return (hyps.get("baseline") or "").strip(), None, False, ""
 
     prompt = build_prompt(hyps, chunk_seconds=chunk_seconds, flags=flags)
-    j = run_llama_cpp_json(cfg, prompt)
+    j, adjudicate_error = run_llama_cpp_json(cfg, prompt)
     if isinstance(j, dict) and has_words(str(j.get("final", ""))):
-        return str(j["final"]).strip(), j, True
+        return str(j["final"]).strip(), j, True, ""
 
-    return choose_fallback_best(hyps) or (hyps.get("baseline") or "").strip(), j if isinstance(j, dict) else None, False
+    return choose_fallback_best(hyps) or (hyps.get("baseline") or "").strip(), j if isinstance(j, dict) else None, False, adjudicate_error

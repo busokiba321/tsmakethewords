@@ -28,7 +28,15 @@ class AppConfig:
 	llama_temp: float = 0.0
 	llama_top_p: float = 1.0
 	llama_max_tokens: int = 900
-	llama_grammar: str = ""  # optional path to GBNF grammar file for llama.cpp
+	llama_grammar: str = "grammars/json.gbnf"  # optional path to GBNF grammar file for llama.cpp
+
+	# ── Alternate ASR hypothesis (Faster-Whisper/CT2)
+	alt_asr_enabled: bool = True
+	alt_asr_model: str = "distil-whisper/distil-large-v3.5-ct2"
+	alt_asr_device: str = "cuda"
+	alt_asr_compute_type: str = "float16"
+	alt_asr_beam_size: int = 5
+	alt_asr_vad_filter: bool = False
 
 
 def load_config() -> AppConfig:
@@ -59,7 +67,13 @@ def load_config() -> AppConfig:
 		llama_temp=float(data.get("llama_temp", 0.0)),
 		llama_top_p=float(data.get("llama_top_p", 1.0)),
 		llama_max_tokens=int(data.get("llama_max_tokens", 900)),
-		llama_grammar=str(data.get("llama_grammar", "")),
+		llama_grammar=str(data.get("llama_grammar", "grammars/json.gbnf")),
+		alt_asr_enabled=bool(data.get("alt_asr_enabled", True)),
+		alt_asr_model=str(data.get("alt_asr_model", "distil-whisper/distil-large-v3.5-ct2")),
+		alt_asr_device=str(data.get("alt_asr_device", "cuda")),
+		alt_asr_compute_type=str(data.get("alt_asr_compute_type", "float16")),
+		alt_asr_beam_size=int(data.get("alt_asr_beam_size", 5)),
+		alt_asr_vad_filter=bool(data.get("alt_asr_vad_filter", False)),
 	)
 
 
@@ -85,5 +99,11 @@ def save_config(cfg: AppConfig) -> None:
 		f"llama_top_p = {float(cfg.llama_top_p)}\n"
 		f"llama_max_tokens = {int(cfg.llama_max_tokens)}\n"
 		f'llama_grammar = "{cfg.llama_grammar}"\n'
+		f"alt_asr_enabled = {str(cfg.alt_asr_enabled).lower()}\n"
+		f'alt_asr_model = "{cfg.alt_asr_model}"\n'
+		f'alt_asr_device = "{cfg.alt_asr_device}"\n'
+		f'alt_asr_compute_type = "{cfg.alt_asr_compute_type}"\n'
+		f"alt_asr_beam_size = {int(cfg.alt_asr_beam_size)}\n"
+		f"alt_asr_vad_filter = {str(cfg.alt_asr_vad_filter).lower()}\n"
 	)
 	CONFIG_PATH.write_text(text, encoding="utf-8")
