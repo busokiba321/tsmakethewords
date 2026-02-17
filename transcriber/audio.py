@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
+import signal
 import subprocess
 import sys
 import uuid
+import shutil
 from pathlib import Path
 
 MAX_DURATION = 5 * 60
@@ -106,12 +108,20 @@ def nemo_probe_has_text(model, wav_path: Path, tmp_dir: Path, *, probe_dur_s: fl
             except TypeError:
                 out = model.transcribe([str(out_wav)], timestamps=False)
         except Exception:
+            out_wav.unlink(missing_ok=True)
             continue
 
         if out:
             txt = (getattr(out[0], "text", "") or "").strip()
             if has_words(txt):
+                out_wav.unlink(missing_ok=True)
                 return True
+        out_wav.unlink(missing_ok=True)
+    # Best-effort: remove probe dir if empty
+    try:
+        probe_root.rmdir()
+    except OSError:
+        pass
     return False
 
 
@@ -130,20 +140,59 @@ def enhance_speech_wav(in_wav: Path, out_wav: Path) -> None:
 def demucs_extract_vocals(in_wav: Path, out_wav: Path, model_name: str = "htdemucs") -> None:
     tmp_root = out_wav.parent / "_demucs"
     tmp_root.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        sys.executable,
-        "-m",
-        "demucs.separate",
-        "-n",
-        model_name,
-        "--two-stems=vocals",
-        "-o",
-        str(tmp_root),
-        str(in_wav),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"Demucs failed. stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}")
+    # Demucs is just preprocessing; if CUDA crashes (common on older GPUs / driver combos),
+    # fallback to CPU so the pipeline still runs. Parakeet can remain on GPU.
+    def _run_demucs(device: str) -> subprocess.CompletedProcess:
+        cmd = [
+            sys.executable,
+            "-m",
+            "demucs",
+            "-n",
+            model_name,
+            "--two-stems",
+            "vocals",
+            "-d",
+            device,
+            "-o",
+            str(tmp_root),
+            str(in_wav),
+        ]
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    # Try CUDA first only if torch reports CUDA available; otherwise CPU directly.
+    devices = ["cpu"]
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            devices = ["cuda", "cpu"]
+    except Exception:
+        # If torch isn't importable here for any reason, don't block the pipeline.
+        devices = ["cpu"]
+
+    proc: subprocess.CompletedProcess | None = None
+    last_err: str | None = None
+    for dev in devices:
+        proc = _run_demucs(dev)
+        if proc.returncode == 0:
+            break
+
+        # Keep a useful error summary for the final exception
+        rc = proc.returncode
+        sig = -rc if rc < 0 else 0
+        sig_name = signal.Signals(sig).name if sig else ""
+        out_preview = (proc.stdout or proc.stderr or "").strip().replace("\n", " ")[:400]
+        last_err = f"device={dev} returncode={rc}" + (f" signal={sig_name}" if sig_name else "") + (f" preview={out_preview}" if out_preview else "")
+    else:
+        # Fell through without success
+        assert proc is not None
+        raise RuntimeError(
+            "Demucs failed.\n"
+            f"  in_wav: {in_wav}\n"
+            f"  model: {model_name}\n"
+            f"  last_attempt: {last_err}\n"
+            f"  stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
+        )
 
     voc = tmp_root / model_name / in_wav.stem / "vocals.wav"
     if not voc.exists():
@@ -151,13 +200,16 @@ def demucs_extract_vocals(in_wav: Path, out_wav: Path, model_name: str = "htdemu
 
     import ffmpeg
 
-    (
-        ffmpeg.input(str(voc))
-        .output(str(out_wav), ar=16000, ac=1, acodec="pcm_s16le", format="wav", loglevel="error")
-        .overwrite_output()
-        .run()
-    )
-
+    try:
+        (
+            ffmpeg.input(str(voc))
+            .output(str(out_wav), ar=16000, ac=1, acodec="pcm_s16le", format="wav", loglevel="error")
+            .overwrite_output()
+            .run()
+        )
+    finally:
+        # Always clean Demucs outputs (can be huge)
+        shutil.rmtree(tmp_root, ignore_errors=True)
 
 def probe(path: Path):
     import ffmpeg
@@ -192,7 +244,7 @@ def convert_and_split(
     import soundfile as sf
 
     base = tmp_dir / uuid.uuid4().hex
-    conv = base.with_suffix(".wav")
+    conv = base.with_suffix(".wav")  # initial 16k mono wav
 
     (
         ffmpeg.input(str(in_path))
@@ -201,31 +253,65 @@ def convert_and_split(
         .run()
     )
 
-    if enhance_speech:
-        enh = base.with_name(base.name + "_enh.wav")
-        enhance_speech_wav(conv, enh)
-        conv.unlink(missing_ok=True)
-        conv = enh
-
-    if use_demucs:
-        voc = base.with_name(base.name + "_vocals.wav")
-        demucs_extract_vocals(conv, voc, model_name=demucs_model)
-        conv.unlink(missing_ok=True)
-        conv = voc
+    # IMPORTANT: For long files, DO NOT run demucs on the full-length wav.
+    # Split first, then run enhance/demucs per chunk to avoid OOM/SIGKILL.
 
     info = sf.info(str(conv))
     if info.duration <= max_duration_s:
-        return [conv]
+        chunks = [conv]
+        conv_is_chunk = True
+    else:
+        pattern = str(base) + "_%03d.wav"
+        (
+            ffmpeg.input(str(conv))
+            .output(
+                pattern,
+                ar=16000,
+                ac=1,
+                f="segment",
+                segment_time=max_duration_s,
+                reset_timestamps=1,
+                loglevel="error",
+            )
+            .overwrite_output()
+            .run()
+        )
+        chunks = sorted(tmp_dir.glob(base.name + "_*.wav"))
+        conv_is_chunk = False
 
-    pattern = str(base) + "_%03d.wav"
-    (
-        ffmpeg.input(str(conv))
-        .output(pattern, ar=16000, ac=1, f="segment", segment_time=max_duration_s, reset_timestamps=1, loglevel="error")
-        .overwrite_output()
-        .run()
-    )
-    conv.unlink(missing_ok=True)
-    return sorted(tmp_dir.glob(base.name + "_*.wav"))
+    # We can delete the full-length wav once we’ve created chunk files.
+    # If the full wav itself is the only chunk, keep it for processing below.
+    if not conv_is_chunk:
+        conv.unlink(missing_ok=True)
+
+    final_chunks: list[Path] = []
+    for i, ch in enumerate(chunks):
+        cur = ch
+
+        if enhance_speech:
+            enh = cur.with_name(cur.stem + "_enh.wav")
+            enhance_speech_wav(cur, enh)
+            # remove prior stage
+            if cur != enh:
+                cur.unlink(missing_ok=True)
+            cur = enh
+
+        if use_demucs:
+            voc = cur.with_name(cur.stem + "_vocals.wav")
+            demucs_extract_vocals(cur, voc, model_name=demucs_model)
+            # remove prior stage
+            if cur != voc:
+                cur.unlink(missing_ok=True)
+            cur = voc
+
+        final_chunks.append(cur)
+
+    # If the only chunk was the original conv wav and we produced a new file,
+    # make sure the original is removed.
+    if conv_is_chunk and conv not in final_chunks:
+        conv.unlink(missing_ok=True)
+
+    return final_chunks
 
 
 def split_wav_fixed(in_wav: Path, out_dir: Path, segment_s: int = 30):
