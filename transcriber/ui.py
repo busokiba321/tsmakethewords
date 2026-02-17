@@ -39,4 +39,4 @@ def maybe_rich_progress(enabled: bool = True):
 
 
 def progress_desc(base: str, idx: int, total: int, mode: str) -> str:
-    return f"{mode} {base}  chunk {idx+1}/{total}"
+    return f"{mode} {base} "

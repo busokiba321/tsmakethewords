@@ -10,7 +10,7 @@ from .config import AppConfig
 from .hypotheses import hypothesis_paths
 from .ui import progress_desc
 from .utils import combine_files, has_words, is_usable_text_file, transcript_stats, words_per_minute
-
+from .tasker_notify import send_with_tailscale
 
 def chunk_paths(base: str, idx: int):
     transcripts_dir = Path("transcripts")
@@ -107,44 +107,6 @@ def transcribe_chunks(
         need_clean = not is_usable_text_file(chunk_txt)
         need_ts = timestamps and (not chunk_ts.exists())
 
-        # Resume-safe adjudication from existing hypotheses without re-running ASR.
-        if cfg.adjudicate and not hpaths["adjudicated_txt"].exists():
-            has_any_hyp = any(is_usable_text_file(p) for p in (hpaths["baseline"], hpaths["recover"], hpaths["alt_asr"]))
-            if has_any_hyp:
-                h = {
-                    "baseline": hpaths["baseline"].read_text(encoding="utf-8", errors="ignore").strip() if hpaths["baseline"].exists() else "",
-                    "recover": hpaths["recover"].read_text(encoding="utf-8", errors="ignore").strip() if hpaths["recover"].exists() else "",
-                    "alt_asr": hpaths["alt_asr"].read_text(encoding="utf-8", errors="ignore").strip() if hpaths["alt_asr"].exists() else "",
-                }
-                multi = sum(1 for v in h.values() if has_words(v)) >= 2
-                if multi:
-                    resume_flags: list[str] = ["resume_adjudicate"]
-                    if is_usable_text_file(hpaths["recover"]):
-                        resume_flags.append("has_recover_hyp")
-                    if is_usable_text_file(hpaths["alt_asr"]):
-                        resume_flags.append("has_alt_asr_hyp")
-
-                    final, j, used, adj_err = adjudicate_chunk(
-                        cfg,
-                        h,
-                        chunk_seconds=float(meta.get("duration_s", 0.0) or 0.0),
-                        flags=resume_flags,
-                    )
-                    adjudicate_error = adj_err
-
-                    if has_words(final):
-                        if isinstance(j, dict):
-                            hpaths["adjudicated_json"].write_text(
-                                json.dumps(j, ensure_ascii=False, indent=2) + "\n",
-                                encoding="utf-8",
-                            )
-                        if used:
-                            hpaths["adjudicated_txt"].write_text(final + "\n", encoding="utf-8")
-                            clean_parts.append(hpaths["adjudicated_txt"])
-                            if progress is not None and chunk_task_id is not None:
-                                progress.advance(chunk_task_id, 1)
-                            continue
-
         result_text = ""
         result_ts_words = []
         out = None
@@ -207,30 +169,22 @@ def transcribe_chunks(
                 alt_asr_error = str(e)
         alt_asr_ok = is_usable_text_file(hpaths["alt_asr"])
 
+        # Phase 1 stitch text: prefer recover when it exists (baseline/recover artifacts remain unchanged).
         final_text = (result_text or "").strip()
-        if cfg.adjudicate:
-            h = {
-                "baseline": hpaths["baseline"].read_text(encoding="utf-8", errors="ignore").strip() if hpaths["baseline"].exists() else "",
-                "recover": hpaths["recover"].read_text(encoding="utf-8", errors="ignore").strip() if hpaths["recover"].exists() else "",
-                "alt_asr": hpaths["alt_asr"].read_text(encoding="utf-8", errors="ignore").strip() if hpaths["alt_asr"].exists() else "",
-            }
-            final_text, j, used_adjudicate, adjudicate_error = adjudicate_chunk(
-                cfg,
-                h,
-                chunk_seconds=float(meta.get("duration_s", 0.0) or 0.0),
-                flags=flags,
-            )
-            if used_adjudicate and isinstance(j, dict):
-                hpaths["adjudicated_json"].write_text(json.dumps(j, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                hpaths["adjudicated_txt"].write_text(final_text + "\n", encoding="utf-8")
-
-        if used_adjudicate and is_usable_text_file(hpaths["adjudicated_txt"]):
-            clean_parts.append(hpaths["adjudicated_txt"])
-        else:
-            if need_clean:
-                chunk_txt.write_text(final_text + "\n", encoding="utf-8")
-            if is_usable_text_file(chunk_txt):
-                clean_parts.append(chunk_txt)
+        if is_usable_text_file(hpaths["recover"]):
+            try:
+                rtxt = hpaths["recover"].read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                rtxt = ""
+            if has_words(rtxt):
+                final_text = rtxt
+        
+        # Phase 1: during ASR we never invoke the adjudicator (prevents VRAM contention with Parakeet).
+        # Always write the chunk text (baseline) unless adjudicated already exists (handled above).
+        if need_clean:
+            chunk_txt.write_text(final_text + "\n", encoding="utf-8")
+        if is_usable_text_file(chunk_txt):
+            clean_parts.append(chunk_txt)
 
         if timestamps and need_ts:
             chunk_ts.parent.mkdir(parents=True, exist_ok=True)
@@ -277,6 +231,101 @@ def transcribe_chunks(
         if progress is not None and chunk_task_id is not None:
             progress.advance(chunk_task_id, 1)
 
+    # Phase 2: post-ASR adjudication (after Parakeet is released from VRAM).
+    if cfg.adjudicate:
+        # Best-effort release of GPU memory held by ASR model.
+        try:
+            model = None  # drop reference
+        except Exception:
+            pass
+        try:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        # Run adjudication only where we have >=2 usable hypotheses and no adjudicated output yet.
+        for idx, c in enumerate(chunks):
+            c = Path(c)
+            hpaths = hypothesis_paths(base, idx)
+            hpaths["dir"].mkdir(parents=True, exist_ok=True)
+
+            # Skip if adjudication already done.
+            if is_usable_text_file(hpaths["adjudicated_txt"]):
+                continue
+
+            # Read hypotheses from disk (resume-safe, no ASR reruns).
+            h = {
+                "baseline": hpaths["baseline"].read_text(encoding="utf-8", errors="ignore").strip()
+                if hpaths["baseline"].exists()
+                else "",
+                "recover": hpaths["recover"].read_text(encoding="utf-8", errors="ignore").strip()
+                if hpaths["recover"].exists()
+                else "",
+                "alt_asr": hpaths["alt_asr"].read_text(encoding="utf-8", errors="ignore").strip()
+                if hpaths["alt_asr"].exists()
+                else "",
+            }
+
+            # Need >= 2 hypotheses with words to adjudicate.
+            if sum(1 for v in h.values() if has_words(v)) < 2:
+                continue
+
+            meta = wav_info(c)
+            post_flags: list[str] = ["post_asr_adjudicate"]
+            if is_usable_text_file(hpaths["recover"]):
+                post_flags.append("has_recover_hyp")
+            if is_usable_text_file(hpaths["alt_asr"]):
+                post_flags.append("has_alt_asr_hyp")
+
+            final_text, j, used, adj_err = adjudicate_chunk(
+                cfg,
+                h,
+                chunk_seconds=float(meta.get("duration_s", 0.0) or 0.0),
+                flags=post_flags,
+            )
+
+            if used and has_words(final_text):
+                if isinstance(j, dict):
+                    hpaths["adjudicated_json"].write_text(
+                        json.dumps(j, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                hpaths["adjudicated_txt"].write_text(final_text.strip() + "\n", encoding="utf-8")
+
+            # Optional: write a second audit record for adjudication phase (append-only).
+            if audit_path is not None:
+                rec2 = {
+                    "phase": "adjudicate",
+                    "base": base,
+                    "chunk_index": idx,
+                    "chunk_wav": str(c),
+                    "used_adjudicate": bool(used and has_words(final_text)),
+                    "adjudicate_error": adj_err or "",
+                    "hyp_baseline_path": str(hpaths["baseline"]) if is_usable_text_file(hpaths["baseline"]) else "",
+                    "hyp_recover_path": str(hpaths["recover"]) if is_usable_text_file(hpaths["recover"]) else "",
+                    "hyp_alt_asr_path": str(hpaths["alt_asr"]) if is_usable_text_file(hpaths["alt_asr"]) else "",
+                    "adjudicated_path": str(hpaths["adjudicated_txt"]) if is_usable_text_file(hpaths["adjudicated_txt"]) else "",
+                    "flags": post_flags,
+                }
+                audit_path.parent.mkdir(parents=True, exist_ok=True)
+                with audit_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec2, ensure_ascii=False) + "\n")
+
+        # Rebuild combined transcript preferring adjudicated outputs when present.
+        final_parts: list[Path] = []
+        for idx, _c in enumerate(chunks):
+            chunk_txt, _chunk_ts, _combined_txt, _combined_ts = chunk_paths(base, idx)
+            hpaths = hypothesis_paths(base, idx)
+            if is_usable_text_file(hpaths["adjudicated_txt"]):
+                final_parts.append(hpaths["adjudicated_txt"])
+            elif is_usable_text_file(chunk_txt):
+                final_parts.append(chunk_txt)
+        clean_parts = final_parts
+
+
     combine_files(combined_txt, clean_parts)
     if timestamps:
         combine_files(combined_ts, ts_parts)
@@ -285,4 +334,5 @@ def transcribe_chunks(
         print(f"⚠️  {base}: empty chunks (ok={empty_ok}, suspicious={suspicious_empty}), rescued_low_coverage={recovered_low_coverage}.")
 
     print(f"📄 Combined transcript: {combined_txt}")
+    send_with_tailscale("Transcription Completed", "The latest transcript has been compiled!")
     return combined_txt, combined_ts

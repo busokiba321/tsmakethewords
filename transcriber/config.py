@@ -22,12 +22,20 @@ class AppConfig:
 	llama_bin: str = "llama-cli"  # or "llama" / "main" depending on build
 	llama_model: str = "models/mistral-7b-instruct.gguf"
 	llama_ctx: int = 4096
-	llama_gpu_layers: int = 999
+	llama_gpu_layers: int = 8
 	llama_threads: int = 6
 	llama_seed: int = 42
 	llama_temp: float = 0.0
 	llama_top_p: float = 1.0
-	llama_max_tokens: int = 900
+	llama_max_tokens: int = 256
+	llama_max_tokens_retry: int = 768
+	llama_timeout_s: int = 1000
+	# Prefer llama-server to avoid per-chunk model reload overhead (critical for Vulkan).
+	llama_use_server: bool = True
+	llama_server_bin: str = ""  # optional override; if empty we infer next to llama_bin
+	llama_server_host: str = "127.0.0.1"
+	llama_server_port: int = 18080
+	llama_server_startup_timeout_s: int = 600
 	llama_grammar: str = "grammars/json.gbnf"  # optional path to GBNF grammar file for llama.cpp
 
 	# ── Alternate ASR hypothesis (Faster-Whisper/CT2)
@@ -61,12 +69,19 @@ def load_config() -> AppConfig:
 		llama_bin=str(data.get("llama_bin", "llama-cli")),
 		llama_model=str(data.get("llama_model", "models/mistral-7b-instruct.gguf")),
 		llama_ctx=int(data.get("llama_ctx", 4096)),
-		llama_gpu_layers=int(data.get("llama_gpu_layers", 999)),
+		llama_gpu_layers=int(data.get("llama_gpu_layers", 8)),
 		llama_threads=int(data.get("llama_threads", 6)),
 		llama_seed=int(data.get("llama_seed", 42)),
 		llama_temp=float(data.get("llama_temp", 0.0)),
 		llama_top_p=float(data.get("llama_top_p", 1.0)),
-		llama_max_tokens=int(data.get("llama_max_tokens", 900)),
+		llama_max_tokens=int(data.get("llama_max_tokens", 256)),
+		llama_timeout_s=int(data.get("llama_timeout_s", 1000)),
+		llama_use_server=bool(data.get("llama_use_server", True)),
+		llama_server_bin=str(data.get("llama_server_bin", "")),
+		llama_server_host=str(data.get("llama_server_host", "127.0.0.1")),
+		llama_server_port=int(data.get("llama_server_port", 18080)),
+		llama_server_startup_timeout_s=int(data.get("llama_server_startup_timeout_s", 600)),
+
 		llama_grammar=str(data.get("llama_grammar", "grammars/json.gbnf")),
 		alt_asr_enabled=bool(data.get("alt_asr_enabled", True)),
 		alt_asr_model=str(data.get("alt_asr_model", "distil-whisper/distil-large-v3.5-ct2")),
@@ -98,6 +113,12 @@ def save_config(cfg: AppConfig) -> None:
 		f"llama_temp = {float(cfg.llama_temp)}\n"
 		f"llama_top_p = {float(cfg.llama_top_p)}\n"
 		f"llama_max_tokens = {int(cfg.llama_max_tokens)}\n"
+		f"llama_timeout_s = {int(cfg.llama_timeout_s)}\n"
+		f"llama_use_server = {str(cfg.llama_use_server).lower()}\n"
+		f'llama_server_bin = "{cfg.llama_server_bin}"\n'
+		f'llama_server_host = "{cfg.llama_server_host}"\n'
+		f"llama_server_port = {int(cfg.llama_server_port)}\n"
+		f"llama_server_startup_timeout_s = {int(cfg.llama_server_startup_timeout_s)}\n"
 		f'llama_grammar = "{cfg.llama_grammar}"\n'
 		f"alt_asr_enabled = {str(cfg.alt_asr_enabled).lower()}\n"
 		f'alt_asr_model = "{cfg.alt_asr_model}"\n'

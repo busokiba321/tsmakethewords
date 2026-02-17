@@ -79,6 +79,8 @@ def main():
 	parser.add_argument("--llama-bin", default=None, help="llama.cpp binary")
 	parser.add_argument("--llama-model", default=None, help="GGUF adjudicator model")
 	parser.add_argument("--llama-grammar", default=None, help="GBNF grammar file")
+	parser.add_argument("--llama-server-bin", default=None, help="llama.cpp llama-server binary (preferred)")
+	parser.add_argument("--no-llama-server", action="store_true", help="Disable llama-server and use llama-cli per call")
 	parser.add_argument("--alt-asr", dest="alt_asr", action="store_true", help="Enable alt ASR hypothesis generation")
 	parser.add_argument("--no-alt-asr", dest="alt_asr", action="store_false", help="Disable alt ASR hypothesis generation")
 	parser.add_argument("--alt-asr-model", default=None, help="Alt ASR model id/path")
@@ -101,6 +103,10 @@ def main():
 		cfg.llama_model = args.llama_model
 	if args.llama_grammar is not None:
 		cfg.llama_grammar = args.llama_grammar
+	if args.llama_server_bin is not None:
+		cfg.llama_server_bin = args.llama_server_bin
+	if args.no_llama_server:
+		cfg.llama_use_server = False
 	if args.alt_asr is not None:
 		cfg.alt_asr_enabled = bool(args.alt_asr)
 	if args.alt_asr_model:
