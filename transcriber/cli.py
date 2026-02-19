@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import importlib.util
 from pathlib import Path
 
 from .config import AppConfig, load_config, save_config
@@ -83,6 +84,7 @@ def main():
 	parser.add_argument("--no-llama-server", action="store_true", help="Disable llama-server and use llama-cli per call")
 	parser.add_argument("--alt-asr", dest="alt_asr", action="store_true", help="Enable alt ASR hypothesis generation")
 	parser.add_argument("--no-alt-asr", dest="alt_asr", action="store_false", help="Disable alt ASR hypothesis generation")
+	parser.add_argument("--alt-asr-allow-download", action="store_true", help="Allow downloads for alt ASR model weights")
 	parser.add_argument("--alt-asr-model", default=None, help="Alt ASR model id/path")
 	parser.add_argument("--alt-asr-compute-type", default=None, help="Alt ASR compute type")
 	parser.add_argument("--alt-asr-beam-size", type=int, default=None, help="Alt ASR beam size")
@@ -109,12 +111,23 @@ def main():
 		cfg.llama_use_server = False
 	if args.alt_asr is not None:
 		cfg.alt_asr_enabled = bool(args.alt_asr)
+	if args.alt_asr_allow_download:
+		cfg.alt_asr_allow_download = True
 	if args.alt_asr_model:
 		cfg.alt_asr_model = args.alt_asr_model
 	if args.alt_asr_compute_type:
 		cfg.alt_asr_compute_type = args.alt_asr_compute_type
 	if args.alt_asr_beam_size is not None:
 		cfg.alt_asr_beam_size = int(args.alt_asr_beam_size)
+
+	# If alt-ASR is enabled, warn early if openai-whisper isn't available.
+	if getattr(cfg, "alt_asr_enabled", False):
+		if importlib.util.find_spec("whisper") is None:
+			print(
+				"⚠️  alt-ASR is enabled but 'openai-whisper' is not installed.\n"
+				"   Install with: pip install -U openai-whisper",
+				file=sys.stderr,
+			)
 
 	enhance_speech = bool(args.enhance_speech) or bool(cfg.enhance_speech)
 	use_demucs = bool(args.demucs) or bool(cfg.use_demucs)

@@ -4,12 +4,12 @@ import json
 from pathlib import Path
 
 from .adjudicate import adjudicate_chunk
-from .alt_asr import run_alt_asr_on_chunk
+from .alt_asr import run_alt_asr_on_chunk, alt_asr_runtime_info
 from .audio import nemo_probe_has_text, split_wav_fixed, vad_likely_speech, vad_stats, wav_info, wav_rms
 from .config import AppConfig
 from .hypotheses import hypothesis_paths
 from .ui import progress_desc
-from .utils import combine_files, has_words, is_usable_text_file, transcript_stats, words_per_minute
+from .utils import clean_repetition, combine_files, has_words, is_usable_text_file, transcript_stats, words_per_minute
 from .tasker_notify import send_with_tailscale
 
 def chunk_paths(base: str, idx: int):
@@ -68,12 +68,26 @@ def transcribe_chunks(
     allow_fallback: bool = True,
     audit_path: Path | None = None,
 ):
+
+    # NOTE: We intentionally stage work to minimize GPU churn and prevent alt-ASR
+    # from running on every chunk.
+    #
+    # Phase A: Parakeet baseline on *all* chunks.
+    # Phase B: Parakeet subchunk recovery only for "needs recovery" chunks.
+    # Phase C: Alt-ASR (Whisper) only for "needs recovery" chunks (initial chunks only).
+    # Phase D: Post-ASR adjudication combining baseline/recover/alt_asr.
     clean_parts: list[Path] = []
+    # Hypotheses to run conservative repetition cleanup on.
+    # Start with alt_asr only (Whisper loop artifacts). Extend later if desired.
+    DEDUP_HYPOTHESES = {"alt_asr", "recover", "baseline"}
     ts_parts: list[Path] = []
     total = len(chunks)
     suspicious_empty = 0
     empty_ok = 0
     recovered_low_coverage = 0
+
+    # Indices where we should run recovery + alt-ASR.
+    rerun_idxs: list[int] = []
 
     if progress is not None and chunk_task_id is not None:
         progress.update(chunk_task_id, total=total, completed=0, description=progress_desc(base, 0, total, "NeMo"))
@@ -98,13 +112,9 @@ def transcribe_chunks(
         hpaths = hypothesis_paths(base, idx)
         hpaths["dir"].mkdir(parents=True, exist_ok=True)
 
-        if cfg.adjudicate and is_usable_text_file(hpaths["adjudicated_txt"]):
-            clean_parts.append(hpaths["adjudicated_txt"])
-            if progress is not None and chunk_task_id is not None:
-                progress.advance(chunk_task_id, 1)
-            continue
-
-        need_clean = not is_usable_text_file(chunk_txt)
+        # Do not short-circuit per-chunk work when adjudication already exists.
+        # We rebuild the combined transcript later, preferring adjudicated outputs.
+        need_clean = not chunk_txt.exists()
         need_ts = timestamps and (not chunk_ts.exists())
 
         result_text = ""
@@ -126,65 +136,61 @@ def transcribe_chunks(
 
         baseline_ok = is_usable_text_file(hpaths["baseline"])
 
-        if not allow_fallback:
-            wc = len((result_text or "").strip().split())
-            wpm = words_per_minute(wc, float(meta.get("duration_s", 0.0) or 0.0))
-            if wpm > 0.0 and wpm < 35.0:
-                _tmp = tmp_dir if tmp_dir is not None else Path(".tmp_audio_chunks")
-                if nemo_probe_has_text(model, c, _tmp, probe_dur_s=15.0):
-                    flags.append("low_wpm_probe_confirmed")
-                    if is_usable_text_file(hpaths["recover"]):
-                        used_recover = True
-                    else:
-                        recovered, recover_error = _run_recover_subchunks(model, c, base, idx, tmp_dir=tmp_dir)
-                        if recovered:
-                            hpaths["recover"].write_text(recovered + "\n", encoding="utf-8")
-                            used_recover = True
-                            recovered_low_coverage += 1
+        # Compute WPM once (0 if we have no text).
+        wc = len((result_text or "").strip().split())
+        wpm = words_per_minute(wc, float(meta.get("duration_s", 0.0) or 0.0))
 
-        if (not allow_fallback) and (not has_words(result_text)):
-            _tmp = tmp_dir if tmp_dir is not None else Path(".tmp_audio_chunks")
-            if nemo_probe_has_text(model, c, _tmp, probe_dur_s=15.0):
-                flags.append("empty_probe_confirmed")
-                suspicious_empty += 1
-                if is_usable_text_file(hpaths["recover"]):
-                    used_recover = True
-                else:
-                    recovered, recover_error = _run_recover_subchunks(model, c, base, idx, tmp_dir=tmp_dir)
-                    if recovered:
-                        hpaths["recover"].write_text(recovered + "\n", encoding="utf-8")
-                        used_recover = True
-            else:
-                empty_ok += 1
+        # We only treat a chunk as "requires rerun" if:
+        # - Parakeet errored, OR
+        # - Parakeet produced empty/low-WPM AND a probe confirms there is transcribable speech.
+        low_wpm_candidate = (wpm > 0.0 and wpm < 35.0)
+        empty_candidate = (not has_words(result_text))
 
-        recover_ok = is_usable_text_file(hpaths["recover"])
-
-        if cfg.alt_asr_enabled and flags and (not is_usable_text_file(hpaths["alt_asr"])):
+        # For rerun gating: VAD is a model-independent signal.
+        # Only compute it for suspicious chunks (empty or low WPM), not for every chunk.
+        vad_says_speech = False
+        if (low_wpm_candidate or empty_candidate):
             try:
-                alt_txt = run_alt_asr_on_chunk(cfg, c)
-                if has_words(alt_txt):
-                    hpaths["alt_asr"].write_text(alt_txt.strip() + "\n", encoding="utf-8")
-                    flags.append("alt_asr_ran")
-            except Exception as e:
-                alt_asr_error = str(e)
-        alt_asr_ok = is_usable_text_file(hpaths["alt_asr"])
-
-        # Phase 1 stitch text: prefer recover when it exists (baseline/recover artifacts remain unchanged).
-        final_text = (result_text or "").strip()
-        if is_usable_text_file(hpaths["recover"]):
-            try:
-                rtxt = hpaths["recover"].read_text(encoding="utf-8", errors="ignore").strip()
+                vad_says_speech = bool(vad_likely_speech(c))
             except Exception:
-                rtxt = ""
-            if has_words(rtxt):
-                final_text = rtxt
-        
-        # Phase 1: during ASR we never invoke the adjudicator (prevents VRAM contention with Parakeet).
-        # Always write the chunk text (baseline) unless adjudicated already exists (handled above).
+                vad_says_speech = False
+
+        probe_lowwpm_ok = False
+        probe_empty_ok = False
+
+        if not allow_fallback:
+            _tmp = tmp_dir if tmp_dir is not None else Path(".tmp_audio_chunks")
+
+            if low_wpm_candidate:
+                try:
+                    probe_lowwpm_ok = nemo_probe_has_text(model, c, _tmp, probe_dur_s=15.0)
+                except Exception as e:
+                    recover_error = recover_error or f"probe_failed: {e}"
+                if probe_lowwpm_ok:
+                    flags.append("low_wpm_probe_confirmed")
+
+            if empty_candidate:
+                try:
+                    probe_empty_ok = nemo_probe_has_text(model, c, _tmp, probe_dur_s=15.0)
+                except Exception as e:
+                    recover_error = recover_error or f"probe_failed: {e}"
+                if probe_empty_ok:
+                    flags.append("empty_probe_confirmed")
+                    suspicious_empty += 1
+                else:
+                    # Only count as "empty_ok" if the chunk is empty AND probe does not confirm speech.
+                    empty_ok += 1
+
+        # "Needs recovery" is defined as: Parakeet errored, or the NeMo probe confirms
+        # there's transcribable speech despite low/empty output.
+        # (We keep VAD for diagnostics, but we do not trigger alt-ASR on VAD alone.)
+        rerun_needed = bool(nemo_error) or probe_lowwpm_ok or probe_empty_ok
+        if rerun_needed:
+            rerun_idxs.append(idx)
+
+        # Phase A output: write baseline chunk text now. Later phases may overwrite.
         if need_clean:
-            chunk_txt.write_text(final_text + "\n", encoding="utf-8")
-        if is_usable_text_file(chunk_txt):
-            clean_parts.append(chunk_txt)
+            chunk_txt.write_text((result_text or "").strip() + "\n", encoding="utf-8")
 
         if timestamps and need_ts:
             chunk_ts.parent.mkdir(parents=True, exist_ok=True)
@@ -196,7 +202,7 @@ def transcribe_chunks(
         if audit_path is not None:
             vad = vad_stats(c, aggressiveness=3, frame_ms=30)
             vad_likely = vad_likely_speech(c)
-            st = transcript_stats(final_text or "")
+            st = transcript_stats((result_text or "").strip())
             wpm = words_per_minute(st["words"], float(meta.get("duration_s", 0.0) or 0.0))
             rec = {
                 "base": base,
@@ -231,7 +237,102 @@ def transcribe_chunks(
         if progress is not None and chunk_task_id is not None:
             progress.advance(chunk_task_id, 1)
 
-    # Phase 2: post-ASR adjudication (after Parakeet is released from VRAM).
+    # ── Phase B: Parakeet subchunk recovery (needs recovery only) ─────────────
+    if (not allow_fallback) and rerun_idxs:
+        for idx in rerun_idxs:
+            c = Path(chunks[idx])
+            chunk_txt, _chunk_ts, _combined_txt, _combined_ts = chunk_paths(base, idx)
+            hpaths = hypothesis_paths(base, idx)
+            hpaths["dir"].mkdir(parents=True, exist_ok=True)
+
+            if is_usable_text_file(hpaths["recover"]):
+                continue
+
+            recovered, recover_error = _run_recover_subchunks(model, c, base, idx, tmp_dir=tmp_dir)
+            if has_words(recovered):
+                hpaths["recover"].write_text(recovered.strip() + "\n", encoding="utf-8")
+                # Prefer recover for chunk text pre-adjudication.
+                try:
+                    chunk_txt.write_text(recovered.strip() + "\n", encoding="utf-8")
+                except Exception:
+                    pass
+                recovered_low_coverage += 1
+
+            if audit_path is not None:
+                rec_recover = {
+                    "phase": "recover",
+                    "base": base,
+                    "chunk_index": idx,
+                    "chunk_wav": str(c),
+                    "recover_ok": bool(is_usable_text_file(hpaths["recover"])),
+                    "recover_error": recover_error or "",
+                    "hyp_recover_path": str(hpaths["recover"]) if is_usable_text_file(hpaths["recover"]) else "",
+                }
+                audit_path.parent.mkdir(parents=True, exist_ok=True)
+                with audit_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec_recover, ensure_ascii=False) + "\n")
+
+    # ── Phase C: Alt-ASR (Whisper) on needs recovery chunks only ──────────────
+    if cfg.alt_asr_enabled and rerun_idxs:
+        for idx in rerun_idxs:
+            c = Path(chunks[idx])
+            chunk_txt, _chunk_ts, _combined_txt, _combined_ts = chunk_paths(base, idx)
+            hpaths = hypothesis_paths(base, idx)
+            hpaths["dir"].mkdir(parents=True, exist_ok=True)
+
+            if is_usable_text_file(hpaths["alt_asr"]):
+                continue
+
+            alt_asr_error = ""
+            try:
+                alt_txt = run_alt_asr_on_chunk(cfg, c)
+                if "alt_asr" in DEDUP_HYPOTHESES and has_words(alt_txt):
+                    alt_txt = clean_repetition(alt_txt, min_ngram_words=12)
+                if has_words(alt_txt):
+                    hpaths["alt_asr"].write_text(alt_txt.strip() + "\n", encoding="utf-8")
+                
+                # Meta written after load so it reflects actual runtime.
+                try:
+                    hpaths["alt_asr_meta"].write_text(
+                        json.dumps(alt_asr_runtime_info(), ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
+                # If baseline was empty and we didn't recover, prefer alt-ASR for chunk text.
+                if (not is_usable_text_file(hpaths["recover"])):
+                    try:
+                        cur = chunk_txt.read_text(encoding="utf-8", errors="ignore").strip() if chunk_txt.exists() else ""
+                    except Exception:
+                        cur = ""
+                    if (not has_words(cur)) and has_words(alt_txt):
+                        try:
+                            chunk_txt.write_text(alt_txt.strip() + "\n", encoding="utf-8")
+                        except Exception:
+                            pass
+            except Exception as e:
+                alt_asr_error = str(e)
+                try:
+                    hpaths["alt_asr_error"].write_text(alt_asr_error.strip() + "\n", encoding="utf-8")
+                except Exception:
+                    pass
+
+            if audit_path is not None:
+                rec_alt = {
+                    "phase": "alt_asr",
+                    "base": base,
+                    "chunk_index": idx,
+                    "chunk_wav": str(c),
+                    "alt_asr_ok": bool(is_usable_text_file(hpaths["alt_asr"])),
+                    "alt_asr_error": alt_asr_error or "",
+                    "hyp_alt_asr_path": str(hpaths["alt_asr"]) if is_usable_text_file(hpaths["alt_asr"]) else "",
+                    "hyp_alt_asr_meta": str(hpaths["alt_asr_meta"]) if hpaths["alt_asr_meta"].exists() else "",
+                }
+                audit_path.parent.mkdir(parents=True, exist_ok=True)
+                with audit_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec_alt, ensure_ascii=False) + "\n")
+
+    # Phase D: post-ASR adjudication (after Parakeet is released from VRAM).
     if cfg.adjudicate:
         # Best-effort release of GPU memory held by ASR model.
         try:
@@ -268,6 +369,15 @@ def transcribe_chunks(
                 if hpaths["alt_asr"].exists()
                 else "",
             }
+
+            # Conservative repetition cleanup (resume-safe).
+            # This prevents a loopy hypothesis from dominating adjudication input.
+            if "alt_asr" in DEDUP_HYPOTHESES and has_words(h.get("alt_asr", "")):
+                h["alt_asr"] = clean_repetition(h["alt_asr"], min_ngram_words=12)
+            if "recover" in DEDUP_HYPOTHESES and has_words(h.get("recover", "")):
+                h["recover"] = clean_repetition(h["recover"], min_ngram_words=12)
+            if "baseline" in DEDUP_HYPOTHESES and has_words(h.get("baseline", "")):
+                h["baseline"] = clean_repetition(h["baseline"], min_ngram_words=12)
 
             # Need >= 2 hypotheses with words to adjudicate.
             if sum(1 for v in h.values() if has_words(v)) < 2:
@@ -325,6 +435,14 @@ def transcribe_chunks(
                 final_parts.append(chunk_txt)
         clean_parts = final_parts
 
+    # If adjudication is disabled, build the combined transcript from the (possibly
+    # updated) per-chunk clean text files.
+    if not cfg.adjudicate:
+        clean_parts = []
+        for idx, _c in enumerate(chunks):
+            chunk_txt, _chunk_ts, _combined_txt, _combined_ts = chunk_paths(base, idx)
+            if is_usable_text_file(chunk_txt):
+                clean_parts.append(chunk_txt)
 
     combine_files(combined_txt, clean_parts)
     if timestamps:

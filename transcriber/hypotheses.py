@@ -15,6 +15,8 @@ def hypothesis_paths(base: str, idx: int) -> dict[str, Path]:
 		"baseline": out_dir / f"{stem}.baseline.txt",
 		"recover": out_dir / f"{stem}.recover.txt",
 		"alt_asr": out_dir / f"{stem}.alt_asr.txt",
+		"alt_asr_meta": out_dir / f"{stem}.alt_asr.meta.json",
+		"alt_asr_error": out_dir / f"{stem}.alt_asr.error.txt",
 		"adjudicated_json": out_dir / f"{stem}.adjudicated.json",
 		"adjudicated_txt": out_dir / f"{stem}.adjudicated.txt",
 	}

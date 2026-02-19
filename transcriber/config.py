@@ -40,9 +40,10 @@ class AppConfig:
 
 	# ── Alternate ASR hypothesis (Faster-Whisper/CT2)
 	alt_asr_enabled: bool = True
-	alt_asr_model: str = "distil-whisper/distil-large-v3.5-ct2"
+	alt_asr_allow_download: bool = False
+	alt_asr_model: str = "small"
 	alt_asr_device: str = "cuda"
-	alt_asr_compute_type: str = "float16"
+	alt_asr_compute_type: str = "fp16"
 	alt_asr_beam_size: int = 5
 	alt_asr_vad_filter: bool = False
 
@@ -84,9 +85,10 @@ def load_config() -> AppConfig:
 
 		llama_grammar=str(data.get("llama_grammar", "grammars/json.gbnf")),
 		alt_asr_enabled=bool(data.get("alt_asr_enabled", True)),
-		alt_asr_model=str(data.get("alt_asr_model", "distil-whisper/distil-large-v3.5-ct2")),
+		alt_asr_allow_download=bool(data.get("alt_asr_allow_download", False)),
+		alt_asr_model=str(data.get("alt_asr_model", "small")),
 		alt_asr_device=str(data.get("alt_asr_device", "cuda")),
-		alt_asr_compute_type=str(data.get("alt_asr_compute_type", "float16")),
+		alt_asr_compute_type=str(data.get("alt_asr_compute_type", "fp16")),
 		alt_asr_beam_size=int(data.get("alt_asr_beam_size", 5)),
 		alt_asr_vad_filter=bool(data.get("alt_asr_vad_filter", False)),
 	)
@@ -121,6 +123,7 @@ def save_config(cfg: AppConfig) -> None:
 		f"llama_server_startup_timeout_s = {int(cfg.llama_server_startup_timeout_s)}\n"
 		f'llama_grammar = "{cfg.llama_grammar}"\n'
 		f"alt_asr_enabled = {str(cfg.alt_asr_enabled).lower()}\n"
+		f"alt_asr_allow_download = {str(cfg.alt_asr_allow_download).lower()}\n"
 		f'alt_asr_model = "{cfg.alt_asr_model}"\n'
 		f'alt_asr_device = "{cfg.alt_asr_device}"\n'
 		f'alt_asr_compute_type = "{cfg.alt_asr_compute_type}"\n'
